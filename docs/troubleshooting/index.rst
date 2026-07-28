@@ -15,4 +15,5 @@ OOM, timeout, reward, tool-call, or agentic rollout issues block progress.
 Troubleshooting pages:
 
 * :doc:`faq`
+* :doc:`port-conflict`
 * :doc:`report-issue`
