@@ -68,6 +68,24 @@ def check_command() -> None:
         raise click.exceptions.Exit(1)
 
 
+@click.command(name="port-check", context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--host", default="0.0.0.0", show_default=True, help="Bind host to check.")
+@click.option("--port", required=True, type=int, help="Port to check.")
+@click.option("--json", "as_json", is_flag=True, help="Emit a machine-readable JSON report.")
+def port_check_command(host: str, port: int, as_json: bool) -> None:
+    """Diagnose whether a port is available for AReno serve/proxy."""
+
+    from areno.cli.port_diag import diagnose_port, format_diagnosis
+
+    diag = diagnose_port(host, port)
+    if as_json:
+        click.echo(json.dumps(diag.to_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(format_diagnosis(diag))
+    if not diag.available:
+        raise click.exceptions.Exit(1)
+
+
 def collect_env() -> dict[str, Any]:
     """Collect a lightweight support report without initializing the engine."""
 

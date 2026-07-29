@@ -580,6 +580,16 @@ def serve_command(
     """Click entry point: build the app and hand it to uvicorn."""
     import uvicorn
 
+    # Port ownership diagnostic – runs *before* expensive model/worker init.
+    from areno.cli.port_diag import diagnose_port, format_diagnosis
+
+    diag = diagnose_port(host, port)
+    if not diag.available:
+        click.echo(format_diagnosis(diag))
+        if not diag.is_areno_child:
+            raise click.exceptions.Exit(1)
+        click.echo("Warning: port held by an AReno process. Proceeding may fail.")
+
     model_path = resolve_model_ref(model_path, model_hub=model_hub)
     from areno.cli.dashboard_registry import register_dashboard_job
 

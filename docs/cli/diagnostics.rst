@@ -78,3 +78,62 @@ Checks include:
 
 ``WARN`` items usually indicate degraded or incomplete setup. ``FAIL`` items
 mean AReno is not ready to run the CUDA training/inference engine.
+
+areno port-check
+----------------
+
+``areno port-check`` diagnoses whether a target ``(host, port)`` is available
+for ``areno serve`` or ``areno proxy`` startup.  If the port is occupied, the
+command identifies the owning process, classifies it as an AReno child process
+or an unrelated external service, and prints a safe, actionable suggestion.
+The diagnostic **never terminates any process**.
+
+.. code-block:: bash
+
+   areno port-check --host 0.0.0.0 --port 8000
+
+For machine-readable output (e.g. scripting):
+
+.. code-block:: bash
+
+   areno port-check --host 0.0.0.0 --port 8000 --json
+
+Example output (port occupied by an unrelated service):
+
+.. code-block:: text
+
+   Port diagnostic: 0.0.0.0:8000
+     Status: occupied
+     PID: 4321
+     Process: nginx
+     AReno child: no
+     Command: nginx -g daemon off
+     Bind error: [Errno 98] Address already in use
+     Suggestion: Port 8000 is held by 'nginx' (PID 4321). Change the port or stop that process manually.
+
+The diagnostic also runs automatically before ``areno serve`` startup, before
+expensive model or worker initialization.  When the port is held by an unrelated
+process, ``areno serve`` exits with an error.  When held by an AReno child
+process, it prints a warning and continues (the subsequent bind may still fail).
+
+Output fields (JSON mode):
+
+* ``host`` – bind host
+* ``port`` – port number
+* ``available`` – ``true`` if the port is free for binding
+* ``pid`` – PID of the process holding the port (``null`` if unknown)
+* ``process_name`` – name of the owning process
+* ``cmdline`` – command line of the owning process
+* ``is_areno_child`` – ``true`` if the process appears to belong to AReno
+* ``bind_error`` – original OS error message if bind failed
+* ``suggestion`` – recommended next action
+
+Limitations:
+
+* Process inspection requires sufficient OS permissions.  On Linux, non-root
+  users may not see processes owned by other users.  When the owner cannot be
+  determined, the original bind error is preserved.
+* Bind races: the port may become occupied between the diagnostic check and the
+  actual startup bind.  In this case the original bind error from the server is
+  surfaced.
+* Supports both IPv4 and IPv6 address families.
