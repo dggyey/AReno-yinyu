@@ -408,6 +408,87 @@ class DashboardState:
         job.metrics.append({"name": name, "value": value, "step": step, "time": now()})
         job.step = max(job.step, step)
 
+    # ------------------------------------------------------------------
+    # Training event detection (Issue #271)
+    # ------------------------------------------------------------------
+
+    def training_events(self, job_id: str | None) -> list[dict[str, Any]]:
+        """Detect structured training events from existing metric data.
+
+        Scans metric points for non-finite values, OOM recovery markers,
+        invalid-batch streaks, and constant rewards.  Does **not** mutate
+        metric data — events are derived views overlaid on charts.
+
+        Returns a list of event dicts sorted by step:
+            {"step": int, "type": str, "severity": str, "message": str, "metric": str|None}
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return []
+        events: list[dict[str, Any]] = []
+        seen_keys: set[tuple[int, str]] = set()
+
+        def _add(step: int, etype: str, severity: str, message: str, metric: str | None = None) -> None:
+            key = (step, etype)
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            events.append({"step": step, "type": etype, "severity": severity, "message": message, "metric": metric})
+
+        # Group metric points by step for cross-metric analysis.
+        by_step: dict[int, dict[str, float]] = {}
+        for point in job.metrics:
+            name = str(point.get("name") or "")
+            value = point.get("value")
+            step = int(point.get("step") or 0)
+            if name and value is not None:
+                by_step.setdefault(step, {})[name] = float(value)
+
+        for step, values in sorted(by_step.items()):
+            # 1. Non-finite values (NaN / Inf) — already filtered by _add_metric,
+            #    but double-check in case JSONL sources slipped through.
+            for name, value in values.items():
+                if math.isnan(value) or math.isinf(value):
+                    _add(step, "non_finite", "error", f"Non-finite value in {name}: {value}", name)
+
+            # 2. Constant rewards — reward stays the same across consecutive steps.
+            reward_key = "rollout/rewards_mean"
+            if reward_key in values:
+                reward = values[reward_key]
+                if step >= 2:
+                    prev1 = by_step.get(step - 1, {}).get(reward_key)
+                    prev2 = by_step.get(step - 2, {}).get(reward_key)
+                    if prev1 is not None and prev2 is not None and prev1 == reward == prev2:
+                        _add(step, "constant_reward", "warn",
+                             f"Reward constant at {reward:.4f} for 3+ steps (steps {step - 2}-{step})", reward_key)
+
+            # 3. Zero loss — potential training collapse.
+            loss_key = "train/loss"
+            if loss_key in values and values[loss_key] == 0.0:
+                _add(step, "zero_loss", "warn", "Loss is exactly 0.0 — possible training collapse", loss_key)
+
+            # 4. Very large loss — potential instability.
+            if loss_key in values and values[loss_key] > 1e4:
+                _add(step, "large_loss", "warn",
+                     f"Loss is very large: {values[loss_key]:.2f} — possible instability", loss_key)
+
+        # 5. Invalid-batch streak — detect consecutive steps with missing metrics.
+        if len(by_step) >= 3:
+            sorted_steps = sorted(by_step.keys())
+            streak = 0
+            for i in range(1, len(sorted_steps)):
+                gap = sorted_steps[i] - sorted_steps[i - 1]
+                if gap > 1:
+                    streak += 1
+                    if streak >= 2:
+                        _add(sorted_steps[i], "invalid_batch_streak", "warn",
+                             f"Missing metrics for {streak}+ consecutive steps around step {sorted_steps[i]}", None)
+                else:
+                    streak = 0
+
+        events.sort(key=lambda e: e["step"])
+        return events
+
     def stop(self, job_id: str) -> bool:
         with self.lock:
             job = self.jobs.get(job_id)
@@ -1494,6 +1575,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/jobs/") and path.endswith("/metrics"):
                 job_id = path.split("/")[-2]
                 self.json({"metrics": STATE.metric_summaries(job_id)})
+            elif path.startswith("/api/jobs/") and path.endswith("/events"):
+                job_id = path.split("/")[-2]
+                self.json({"events": STATE.training_events(job_id)})
             elif path.startswith("/api/jobs/") and path.endswith("/metric"):
                 job_id = path.split("/")[-2]
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)

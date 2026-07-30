@@ -1127,6 +1127,8 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
   const [points, setPoints] = useState([]);
   const [metricLoading, setMetricLoading] = useState(false);
   const [prevJobId, setPrevJobId] = useState(jobId);
+  const [events, setEvents] = useState([]);
+  const [eventFilter, setEventFilter] = useState("all");
   // Reset the selection during render (not in an effect) when the job changes so
   // the reset happens before any effect runs. This avoids a stale-name fetch and
   // a stuck loading state on job switch, while live polls (refreshNonce) still
@@ -1137,6 +1139,7 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
     setMetricList([]);
     setPoints([]);
     setMetricLoading(false);
+    setEvents([]);
   }
   const names = metricNamesFrom(metricList);
   const effectiveName = resolveActiveMetricName(names, selectedName);
@@ -1184,10 +1187,59 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
       cancelled = true;
     };
   }, [jobId, effectiveName, refreshNonce]);
+
+  // Fetch training events for overlay (Issue #271).
+  useEffect(() => {
+    let cancelled = false;
+    if (!jobId) {
+      setEvents([]);
+      return undefined;
+    }
+    api(`/api/jobs/${jobId}/events`)
+      .then((data) => {
+        if (!cancelled) setEvents(data.events || []);
+      })
+      .catch(() => {
+        if (!cancelled) setEvents([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, refreshNonce]);
+
   const activeName = effectiveName;
   const visiblePoints = points.slice(-240);
   const smoothed = smoothTensorboard(visiblePoints, smooth);
   const plot = buildMetricPlot(visiblePoints, smoothed);
+
+  // Compute event markers positioned on the chart's x-axis.
+  const eventTypes = Array.from(new Set(events.map((e) => e.type)));
+  const filteredEvents = eventFilter === "all" ? events : events.filter((e) => e.type === eventFilter);
+  const eventMarkers = visiblePoints.length > 0 && plot.coords.length > 0
+    ? filteredEvents
+        .filter((e) => {
+          // Only show events that fall within the visible step range.
+          const stepMin = visiblePoints[0].step;
+          const stepMax = visiblePoints[visiblePoints.length - 1].step;
+          return e.step >= stepMin && e.step <= stepMax;
+        })
+        .map((event) => {
+          const stepMin = visiblePoints[0].step;
+          const stepMax = visiblePoints[visiblePoints.length - 1].step;
+          const stepSpan = Math.max(stepMax - stepMin, 1);
+          const x = ((event.step - stepMin) / stepSpan) * 700 + 10;
+          return { ...event, x };
+        })
+    : [];
+
+  const eventColors = {
+    non_finite: "var(--deck-red)",
+    constant_reward: "var(--deck-amber)",
+    zero_loss: "var(--deck-amber)",
+    large_loss: "var(--deck-amber)",
+    invalid_batch_streak: "var(--deck-violet)",
+  };
+
   return (
     <div className="chart">
       <div className="chartHeader">
@@ -1200,6 +1252,14 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
             smooth {smooth.toFixed(2)}
             <input type="range" min="0" max="0.99" step="0.01" value={smooth} onChange={(event) => setSmooth(Number(event.target.value))} />
           </label>
+          {eventTypes.length > 0 && (
+            <select value={eventFilter} onChange={(event) => setEventFilter(event.target.value)} title="Filter training events">
+              <option value="all">all events ({events.length})</option>
+              {eventTypes.map((type) => (
+                <option key={type} value={type}>{type} ({events.filter((e) => e.type === type).length})</option>
+              ))}
+            </select>
+          )}
         </div>
       </div>
       {visiblePoints.length === 0 ? (
@@ -1216,11 +1276,32 @@ function MetricChart({ jobId, metricsDir, refreshNonce }) {
               <title>{`${activeName} step ${point.step}: ${point.value}`}</title>
             </circle>
           ))}
+          {/* Training event overlays (Issue #271) */}
+          {eventMarkers.map((event, index) => (
+            <g key={`event-${event.step}-${event.type}-${index}`}>
+              <line
+                x1={event.x.toFixed(1)} x2={event.x.toFixed(1)}
+                y1="10" y2="170"
+                stroke={eventColors[event.type] || "var(--deck-red)"}
+                strokeWidth="1.5"
+                strokeDasharray="3 3"
+                opacity="0.7"
+              />
+              <circle
+                cx={event.x.toFixed(1)} cy="12"
+                r="4"
+                fill={eventColors[event.type] || "var(--deck-red)"}
+                stroke="var(--bg-primary)" strokeWidth="1"
+              />
+              <title>{`Step ${event.step}: [${event.severity}] ${event.message}`}</title>
+            </g>
+          ))}
         </svg>
       )}
       <div className="plotFooter">
         <span>{activeName || "metric"} · {points.length} points</span>
         <span>{metricsDir || "no metrics dir"} · {plot.minLabel} to {plot.maxLabel}</span>
+        {eventMarkers.length > 0 && <span className="eventCount">· {eventMarkers.length} events</span>}
       </div>
     </div>
   );

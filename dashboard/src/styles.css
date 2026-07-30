@@ -829,6 +829,11 @@ p {
   border-radius: var(--radius-md);
 }
 
+.eventCount {
+  color: var(--deck-amber);
+  font-weight: 600;
+}
+
 .timePerf {
   margin-bottom: 12px;
   border: 1px solid var(--deck-line);

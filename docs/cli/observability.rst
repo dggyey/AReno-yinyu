@@ -175,3 +175,75 @@ When a trajectory is dropped for exceeding the model context window,
 counts, message counts, assistant turn counts, tool-result counts, and a short
 prompt preview. This is the fastest way to debug overlong agentic examples
 without dumping every token in every trajectory.
+
+Training event overlay
+----------------------
+
+The AReno Dashboard automatically detects structured training events from
+existing metric data and overlays them on the TensorBoard scalar charts as
+clickable vertical markers.  No configuration is required — events are derived
+from the same metric points that the Dashboard already loads.
+
+Detected event types:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 60
+
+   * - Type
+     - Severity
+     - Description
+   * - ``non_finite``
+     - error
+     - NaN or Inf detected in any metric value
+   * - ``constant_reward``
+     - warn
+     - ``rollout/rewards_mean`` unchanged for 3+ consecutive steps
+   * - ``zero_loss``
+     - warn
+     - ``train/loss`` is exactly 0.0 — possible training collapse
+   * - ``large_loss``
+     - warn
+     - ``train/loss`` exceeds 10,000 — possible instability
+   * - ``invalid_batch_streak``
+     - warn
+     - Missing metrics for 2+ consecutive steps — possible invalid batches
+
+API endpoint:
+
+.. code-block:: bash
+
+   GET /api/jobs/{jobId}/events
+
+Returns a JSON array of event objects sorted by step:
+
+.. code-block:: json
+
+   [
+     {
+       "step": 42,
+       "type": "non_finite",
+       "severity": "error",
+       "message": "Non-finite value in train/loss: nan",
+       "metric": "train/loss"
+     }
+   ]
+
+Dashboard chart interaction:
+
+- **Vertical dashed lines** mark each event on the metric chart, colored by
+  severity (red for errors, amber for warnings, violet for invalid-batch streaks).
+- A **dropdown filter** in the chart header lets you show/hide specific event
+  types.
+- Hover over a marker to see the full event message in a tooltip.
+- Events do **not** modify the underlying metric data — they are a read-only
+  derived view.
+
+Limitations:
+
+- Events are derived from metric points loaded by the Dashboard.  Legacy runs
+  without metric files produce no events (backward compatible).
+- Event detection runs on each Dashboard refresh cycle (polling), not in
+  real-time during training.
+- The ``invalid_batch_streak`` detector relies on step gaps in metric data; if
+  metrics are written sparsely, false positives may appear.
