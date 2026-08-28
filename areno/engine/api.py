@@ -26,11 +26,14 @@ from typing import Any
 
 import torch
 
+from areno.adapters.config import LoraConfig
 from areno.engine.checkpoints.io import resolve_model_path
 from areno.engine.config import EngineConfig, OptimizerConfig, RuntimeConfig
 from areno.engine.data import RolloutOutput, SamplingParams, TrainStats, to_cpu
+from areno.engine.modeling import canonical_model_path
 from areno.engine.protocol import (
     EnsureRolesPayload,
+    ExportAdapterPayload,
     Op,
     RoleSpecPayload,
     RolloutCacheProbePayload,
@@ -80,7 +83,10 @@ def _merge_dp_rollouts_by_prompt_indices(
 
     if total_count == 0:
         return _merge_rollouts([])
-    rows: list[tuple[list[int], list[int], str, torch.Tensor] | None] = [None for _ in range(total_count)]
+    routed_experts = [] if any(output is not None and output.routed_experts is not None for output in outputs) else None
+    rows: list[tuple[list[int], list[int], str, torch.Tensor, torch.Tensor | None] | None] = [
+        None for _ in range(total_count)
+    ]
     for dp_rank, output in enumerate(outputs):
         if output is None:
             continue
@@ -94,11 +100,17 @@ def _merge_dp_rollouts_by_prompt_indices(
             if row_idx < 0 or row_idx >= total_count:
                 raise RuntimeError(f"DP rollout prompt index out of chunk range: original_idx={original_idx}")
             response = output.response_ids[local_idx]
+            routes = None
+            if routed_experts is not None:
+                if output.routed_experts is None:
+                    raise RuntimeError("routing replay is missing from one DP rollout shard")
+                routes = output.routed_experts[local_idx]
             rows[row_idx] = (
                 output.prompt_ids[local_idx],
                 response,
                 output.finish_reason[local_idx],
                 output.logprobs[local_idx, : len(response)].detach().cpu(),
+                routes,
             )
     if any(row is None for row in rows):
         missing = [idx for idx, row in enumerate(rows) if row is None]
@@ -110,7 +122,18 @@ def _merge_dp_rollouts_by_prompt_indices(
         [row[2] for row in materialized],
         [row[3] for row in materialized],
         metrics=None,
+        adapter_version=_rollout_version(non_empty=[output for output in outputs if output is not None]),
+        routed_experts=[row[4] for row in materialized if row[4] is not None] if routed_experts is not None else None,
     )
+
+
+def _rollout_version(*, non_empty: list[RolloutOutput]) -> int | None:
+    versions = {output.adapter_version for output in non_empty}
+    if not versions:
+        return None
+    if len(versions) != 1:
+        raise RuntimeError(f"rollout DP replicas reported different adapter versions: {versions}")
+    return versions.pop()
 
 
 class ArenoEngine:
@@ -131,7 +154,13 @@ class ArenoEngine:
       rollout paths.
     """
 
-    def __init__(self, config: EngineConfig):
+    def __init__(
+        self,
+        config: EngineConfig,
+        *,
+        start: bool = True,
+        cluster_kwargs: dict[str, Any] | None = None,
+    ):
         """Start rank workers for a validated engine config.
 
         Constructs the :class:`TPCluster` and starts the underlying worker
@@ -140,13 +169,14 @@ class ArenoEngine:
 
         # Loss function is required because the engine always carries a trainer
         # path; pure-inference engines should still set a no-op loss.
-        if config.train_loss_fn is None:
+        if config.role == "train" and config.train_loss_fn is None:
             raise ValueError("ArenoEngine requires train_loss_fn")
         self.config = config
         # TPCluster owns the per-rank worker processes and the IPC channels;
         # ``ArenoWorker`` is the rank-side command loop.
-        self.cluster = TPCluster(config, ArenoWorker)
-        self.cluster.start()
+        self.cluster = TPCluster(config, ArenoWorker, **(cluster_kwargs or {}))
+        if start:
+            self.cluster.start()
         self._async_dp_cursor = count()
 
     def begin_rollout_session(self) -> None:
@@ -180,12 +210,20 @@ class ArenoEngine:
         model: str,
         *,
         tp_size: int = 1,
+        sequence_parallel: bool | None = None,
         dp_size: int | None = None,
         devices: list[int] | None = None,
         dummy_load: bool = False,
         optimizer_config: OptimizerConfig | None = None,
         runtime_config: RuntimeConfig | None = None,
         loss_fn: Callable[[Any, torch.Tensor], torch.Tensor | tuple[torch.Tensor, dict[str, Any]]] | None = None,
+        role: str = "train",
+        start: bool = True,
+        cluster_kwargs: dict[str, Any] | None = None,
+        policy_sync_bucket_mb: int = 64,
+        lora_config: LoraConfig | None = None,
+        reference_mode: str = "independent",
+        base_model_name_or_path: str | None = None,
     ) -> ArenoEngine:
         """Build an engine by reading model config from a checkpoint path.
 
@@ -206,15 +244,22 @@ class ArenoEngine:
         cfg = EngineConfig(
             model=model_config,
             model_path=model_path,
+            base_model_name_or_path=(model if base_model_name_or_path is None else base_model_name_or_path),
             train_loss_fn=loss_fn,
             tp_size=tp_size,
+            sequence_parallel=sequence_parallel,
             dp_size=dp_size,
             devices=devices,
             dummy_load=dummy_load,
             optimizer=optimizer_config or OptimizerConfig(),
             runtime=runtime_config or RuntimeConfig(),
+            role=role,
+            policy_sync_bucket_mb=policy_sync_bucket_mb,
+            lora=lora_config,
+            lora_seed=torch.initial_seed(),
+            reference_mode=reference_mode,
         )
-        return cls(cfg)
+        return cls(cfg, start=start, cluster_kwargs=cluster_kwargs)
 
     def generate_rollout(
         self,
@@ -225,6 +270,7 @@ class ArenoEngine:
         max_prompt_len: int | None = None,
         eos_token_id: int | None = None,
         sampling_params: SamplingParams | None = None,
+        prompt_features: list[dict[str, Any] | None] | None = None,
         decode_progress_interval_s: float = 0.0,
         cancel_flags: torch.Tensor | None = None,
     ) -> RolloutOutput:
@@ -242,6 +288,8 @@ class ArenoEngine:
 
         if not prompts:
             raise ValueError("prompts must be non-empty")
+        if prompt_features is not None and len(prompt_features) != len(prompts):
+            raise ValueError("prompt_features must have the same length as prompts")
         if max_running_prompts < 1:
             raise ValueError("max_running_prompts must be >= 1")
         sampling_params = sampling_params or SamplingParams()
@@ -269,6 +317,11 @@ class ArenoEngine:
             chunk_start = sum(len(output.prompt_ids) for output in outputs)
             # Round-robin chunk rows across DP ranks; per-rank token rows.
             prompts_by_dp = split_list_by_dp(chunk, int(self.config.dp_size))
+            chunk_features = None
+            prompt_features_by_dp = None
+            if prompt_features is not None:
+                chunk_features = prompt_features[chunk_start : chunk_start + len(chunk)]
+                prompt_features_by_dp = split_list_by_dp(chunk_features, int(self.config.dp_size))
             # Parallel split of the global prompt indices for downstream mapping.
             prompt_indices_by_dp = split_list_by_dp(
                 list(range(chunk_start, chunk_start + len(chunk))), int(self.config.dp_size)
@@ -288,6 +341,7 @@ class ArenoEngine:
                 RolloutPayload(
                     prompts_by_dp=prompts_by_dp,
                     prompt_indices_by_dp=prompt_indices_by_dp,
+                    prompt_features_by_dp=prompt_features_by_dp,
                     max_new_tokens=max_new_tokens,
                     eos_token_id=eos_token_id,
                     sampling_params=sampling_params,
@@ -360,6 +414,7 @@ class ArenoEngine:
         max_prompt_len: int | None = None,
         eos_token_id: int | None = None,
         sampling_params: SamplingParams | None = None,
+        prompt_features: list[dict[str, Any] | None] | None = None,
         decode_progress_interval_s: float = 0.0,
         cancel_flags: torch.Tensor | None = None,
     ) -> RolloutOutput:
@@ -372,6 +427,7 @@ class ArenoEngine:
             max_prompt_len=max_prompt_len,
             eos_token_id=eos_token_id,
             sampling_params=sampling_params,
+            prompt_features=prompt_features,
             decode_progress_interval_s=decode_progress_interval_s,
             cancel_flags=cancel_flags,
         )
@@ -385,6 +441,7 @@ class ArenoEngine:
         max_prompt_len: int | None = None,
         eos_token_id: int | None = None,
         sampling_params: SamplingParams | None = None,
+        prompt_features: list[dict[str, Any] | None] | None = None,
         decode_progress_interval_s: float = 0.0,
         cancel_flags: torch.Tensor | None = None,
     ) -> RolloutOutput:
@@ -392,6 +449,8 @@ class ArenoEngine:
 
         if not prompts:
             raise ValueError("prompts must be non-empty")
+        if prompt_features is not None and len(prompt_features) != len(prompts):
+            raise ValueError("prompt_features must have the same length as prompts")
         if max_running_prompts < 1:
             raise ValueError("max_running_prompts must be >= 1")
         sampling_params = sampling_params or SamplingParams()
@@ -415,6 +474,10 @@ class ArenoEngine:
         for chunk in chunks:
             chunk_start = sum(len(output.prompt_ids) for output in outputs)
             prompts_by_dp = _split_list_by_dp_with_offset(chunk, dp_size, dp_start)
+            prompt_features_by_dp = None
+            if prompt_features is not None:
+                chunk_features = prompt_features[chunk_start : chunk_start + len(chunk)]
+                prompt_features_by_dp = _split_list_by_dp_with_offset(chunk_features, dp_size, dp_start)
             prompt_indices_by_dp = _split_list_by_dp_with_offset(
                 list(range(chunk_start, chunk_start + len(chunk))), dp_size, dp_start
             )
@@ -425,6 +488,7 @@ class ArenoEngine:
             payload = RolloutPayload(
                 prompts_by_dp=prompts_by_dp,
                 prompt_indices_by_dp=prompt_indices_by_dp,
+                prompt_features_by_dp=prompt_features_by_dp,
                 max_new_tokens=max_new_tokens,
                 eos_token_id=eos_token_id,
                 sampling_params=sampling_params,
@@ -513,14 +577,28 @@ class ArenoEngine:
                     path=str(spec.path),
                     trainable=bool(spec.trainable),
                     optimizer_lr=getattr(spec, "optimizer_lr", None),
+                    reference_mode=self._role_reference_mode(name, str(spec.path)),
                 )
                 for name, spec in roles.items()
             }
         )
         self.cluster.call(Op.ENSURE_ROLES, payload)
 
+    def _role_reference_mode(self, name: str, path: str) -> str:
+        mode = self.config.reference_mode if name == "ref" else "independent"
+        if mode == "reuse_actor_base" and canonical_model_path(path) != canonical_model_path(self.config.model_path):
+            raise ValueError("reuse_actor_base requires the reference checkpoint to match the actor base checkpoint")
+        return mode
+
     def score_logprobs(
-        self, role: str, token_rows: list[list[int]], *, pad_token_id: int, microbatch_size: int = 8
+        self,
+        role: str,
+        token_rows: list[list[int]],
+        *,
+        pad_token_id: int,
+        features: list[dict[str, Any] | None] | None = None,
+        routed_experts: list[object] | None = None,
+        microbatch_size: int = 8,
     ) -> list[list[float]]:
         """Score fixed token rows with a model role.
 
@@ -531,18 +609,33 @@ class ArenoEngine:
 
         if not token_rows:
             return []
+        if features is not None and len(features) != len(token_rows):
+            raise ValueError("features must have the same length as token_rows")
+        if routed_experts is not None and len(routed_experts) != len(token_rows):
+            raise ValueError("routed_experts must have the same length as token_rows")
         results = self.cluster.call(
             Op.SCORE_LOGPROBS,
             ScorePayload(
                 role=role,
                 token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)),
+                features_by_dp=split_list_by_dp(features, int(self.config.dp_size)) if features is not None else None,
                 pad_token_id=int(pad_token_id),
+                routing_replay_by_dp=(
+                    split_list_by_dp(routed_experts, int(self.config.dp_size)) if routed_experts is not None else None
+                ),
                 microbatch_size=int(microbatch_size),
             ),
         )
         return _merge_dp_rank0_strided_results(results, self.config.tp_size, int(self.config.dp_size))
 
-    def score_values(self, role: str, token_rows: list[list[int]], *, pad_token_id: int) -> list[list[float]]:
+    def score_values(
+        self,
+        role: str,
+        token_rows: list[list[int]],
+        *,
+        pad_token_id: int,
+        features: list[dict[str, Any] | None] | None = None,
+    ) -> list[list[float]]:
         """Score per-token values with a critic role.
 
         Dispatches ``Op.SCORE_VALUES`` (blocking). Same shape contract as
@@ -551,17 +644,27 @@ class ArenoEngine:
 
         if not token_rows:
             return []
+        if features is not None and len(features) != len(token_rows):
+            raise ValueError("features must have the same length as token_rows")
         results = self.cluster.call(
             Op.SCORE_VALUES,
             ScorePayload(
                 role=role,
                 token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)),
+                features_by_dp=split_list_by_dp(features, int(self.config.dp_size)) if features is not None else None,
                 pad_token_id=int(pad_token_id),
             ),
         )
         return _merge_dp_rank0_strided_results(results, self.config.tp_size, int(self.config.dp_size))
 
-    def score_rewards(self, role: str, token_rows: list[list[int]], *, pad_token_id: int) -> list[float]:
+    def score_rewards(
+        self,
+        role: str,
+        token_rows: list[list[int]],
+        *,
+        pad_token_id: int,
+        features: list[dict[str, Any] | None] | None = None,
+    ) -> list[float]:
         """Score sequence rewards with a reward model role.
 
         Dispatches ``Op.SCORE_REWARDS`` (blocking). Returns one scalar reward
@@ -570,11 +673,14 @@ class ArenoEngine:
 
         if not token_rows:
             return []
+        if features is not None and len(features) != len(token_rows):
+            raise ValueError("features must have the same length as token_rows")
         results = self.cluster.call(
             Op.SCORE_REWARDS,
             ScorePayload(
                 role=role,
                 token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)),
+                features_by_dp=split_list_by_dp(features, int(self.config.dp_size)) if features is not None else None,
                 pad_token_id=int(pad_token_id),
             ),
         )
@@ -624,15 +730,26 @@ class ArenoEngine:
         return merge_metric_dicts(rank0_results) or {}
 
     def save_checkpoint(self, path: str) -> str:
-        """Ask workers to write a HuggingFace-compatible checkpoint.
+        """Save base weights, or the standard PEFT artifact in native LoRA mode.
 
-        Dispatches ``Op.SAVE_CHECKPOINT`` (blocking). Workers cooperatively
-        write shards to ``path``; only rank 0's returned path is propagated
-        back to the caller.
+        Fullweight workers cooperatively write HuggingFace shards to ``path``.
+        Native LoRA keeps the base frozen, so its checkpoint is the adapter-only
+        PEFT artifact consumed by training and serving.
         """
 
+        if self.config.lora is not None:
+            return self.export_adapter(path)
         results = self.cluster.call(Op.SAVE_CHECKPOINT, SaveCheckpointPayload(path=path))
         return results[0]["path"]
+
+    def export_adapter(self, path: str) -> str:
+        """Export the live native LoRA weights as a standard PEFT adapter."""
+
+        results = self.cluster.call(Op.EXPORT_ADAPTER, ExportAdapterPayload(path=path))
+        result = next((result for result in results if result is not None), None)
+        if result is None:
+            raise RuntimeError("native LoRA export did not produce an artifact")
+        return result["path"]
 
     def _transport_payload(self, payload: Any) -> Any:
         """Move tensors to CPU shared memory for zero-copy IPC to workers."""

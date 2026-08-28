@@ -11,15 +11,18 @@ The flow is:
        function), and runs the trainer to completion.
 """
 
+from __future__ import annotations
+
 import ast
 import importlib.util
 import json
 import logging
 import shutil
 import textwrap
-from dataclasses import fields
+from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import click
 
@@ -33,11 +36,34 @@ from areno.api.trainer_config import (
     TrainerConfig,
 )
 from areno.cli.model_refs import resolve_model_refs_for_config
-from areno.engine.config import (
-    ModelConfig,
-    flash_attention_unsupported_gpu_reason,
-    flash_attention_unsupported_model_reason,
-)
+
+if TYPE_CHECKING:
+    from areno.engine.config import ModelConfig
+
+
+def config_from_hf(model_path: str):
+    """Load CUDA model config lazily while preserving the injectable CLI seam."""
+
+    from areno.models.registry import config_from_hf as load_config
+
+    return load_config(model_path)
+
+
+def flash_attention_unsupported_gpu_reason(devices):
+    """Resolve CUDA capability lazily so MLX-only imports do not require Torch."""
+
+    from areno.engine.config import flash_attention_unsupported_gpu_reason as resolve_reason
+
+    return resolve_reason(devices)
+
+
+def flash_attention_unsupported_model_reason(model_config):
+    """Resolve model attention support lazily so tests can replace the probe."""
+
+    from areno.engine.config import flash_attention_unsupported_model_reason as resolve_reason
+
+    return resolve_reason(model_config)
+
 
 # Group `areno train --help` flags by user intent rather than as one flat wall.
 # Each entry is (section title, option param names in display order). Every
@@ -56,6 +82,7 @@ TRAIN_OPTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "algo",
             "ckpt",
+            "base_model_name_or_path",
             "dataset_path",
             "model_hub",
             "dataset_loader_fn",
@@ -68,12 +95,17 @@ TRAIN_OPTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "max_steps",
             "world_size",
             "tp_size",
+            "sequence_parallel",
+            "train_devices",
         ),
     ),
     (
         "Rollout",
         (
             "batch_size",
+            "rollout_tp_size",
+            "rollout_devices",
+            "policy_sync_bucket_mb",
             "n_samples",
             "max_running_prompts",
             "max_prompt_tokens",
@@ -101,6 +133,12 @@ TRAIN_OPTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "score_micro_bs",
             "gradient_accumulation_steps",
             "activation_checkpointing",
+            "lora_rank",
+            "lora_alpha",
+            "lora_dropout",
+            "lora_target_modules",
+            "lora_adapter_path",
+            "reference_mode",
             "lr",
             "min_lr",
             "lr_decay_steps",
@@ -108,6 +146,19 @@ TRAIN_OPTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "adam_beta1",
             "adam_beta2",
             "adam_8bit",
+            "optimizer_state_offload",
+            "optimizer_state_offload_dir",
+            "optimizer_state_offload_batch_size",
+            "unfreeze_multimodal_tower",
+            "unfreeze_multimodal_projector",
+            "multimodal_tower_lr",
+            "multimodal_tower_min_lr",
+            "multimodal_tower_lr_decay_steps",
+            "multimodal_tower_lr_decay_style",
+            "multimodal_projector_lr",
+            "multimodal_projector_min_lr",
+            "multimodal_projector_lr_decay_steps",
+            "multimodal_projector_lr_decay_style",
             "weight_decay",
             "grad_clip_norm",
             "ref_ckpt",
@@ -173,9 +224,58 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
     """Build a typed trainer config from Click option values."""
 
     args = SimpleNamespace(**options)
+    backend = getattr(args, "backend", None)
+    if backend is None:
+        from areno.api.config import default_backend_type
+
+        backend = default_backend_type().value
+    args.backend = backend.lower()
     args.max_steps = getattr(args, "max_steps", None)
     args.score_micro_bs = getattr(args, "score_micro_bs", 8)
     args.model_hub = getattr(args, "model_hub", "modelscope")
+    args.base_model_name_or_path = getattr(args, "base_model_name_or_path", None)
+    args.train_devices = getattr(args, "train_devices", None)
+    args.sequence_parallel = getattr(args, "sequence_parallel", None)
+    args.rollout_tp_size = getattr(args, "rollout_tp_size", None)
+    args.rollout_devices = getattr(args, "rollout_devices", None)
+    args.policy_sync_bucket_mb = getattr(args, "policy_sync_bucket_mb", 64)
+    args.optimizer_state_offload = getattr(args, "optimizer_state_offload", "none")
+    args.optimizer_state_offload_dir = getattr(args, "optimizer_state_offload_dir", None)
+    args.optimizer_state_offload_batch_size = getattr(args, "optimizer_state_offload_batch_size", 1)
+    args.unfreeze_multimodal_tower = getattr(args, "unfreeze_multimodal_tower", False)
+    args.unfreeze_multimodal_projector = getattr(args, "unfreeze_multimodal_projector", False)
+    args.multimodal_tower_lr = getattr(args, "multimodal_tower_lr", None)
+    args.multimodal_tower_min_lr = getattr(args, "multimodal_tower_min_lr", None)
+    args.multimodal_tower_lr_decay_steps = getattr(args, "multimodal_tower_lr_decay_steps", None)
+    args.multimodal_tower_lr_decay_style = getattr(args, "multimodal_tower_lr_decay_style", None)
+    args.multimodal_projector_lr = getattr(args, "multimodal_projector_lr", None)
+    args.multimodal_projector_min_lr = getattr(args, "multimodal_projector_min_lr", None)
+    args.multimodal_projector_lr_decay_steps = getattr(args, "multimodal_projector_lr_decay_steps", None)
+    args.multimodal_projector_lr_decay_style = getattr(args, "multimodal_projector_lr_decay_style", None)
+    args.reference_mode = getattr(args, "reference_mode", "independent")
+    args.lora = _lora_config_from_options(args)
+    if args.backend == "mlx":
+        if args.train_devices is not None or args.rollout_devices is not None or args.rollout_tp_size is not None:
+            raise click.UsageError("MLX does not use CUDA device or rollout TP options")
+        if args.tp_size not in {1, 4} or args.world_size not in {1, 8}:
+            raise click.UsageError("MLX currently supports only one process and one device")
+        args.tp_size = 1
+        args.world_size = 1
+        args.train_devices = None
+        args.rollout_devices = None
+    else:
+        args.train_devices = _parse_cuda_devices(getattr(args, "train_devices", None), "--train-devices")
+        args.rollout_devices = _parse_cuda_devices(getattr(args, "rollout_devices", None), "--rollout-devices")
+    if args.rollout_tp_size is not None and args.rollout_tp_size <= 0:
+        raise click.UsageError("--rollout-tp-size must be positive")
+    if args.backend != "mlx" and args.train_devices is not None:
+        args.world_size = len(args.train_devices)
+    elif args.backend != "mlx":
+        args.train_devices = list(range(args.world_size))
+    if args.rollout_devices is None and args.rollout_tp_size is not None:
+        args.rollout_devices = list(args.train_devices)
+    args.rollout_tp_size = getattr(args, "rollout_tp_size", None)
+    args.policy_sync_bucket_mb = getattr(args, "policy_sync_bucket_mb", 64)
     smoke_infer = bool(getattr(args, "smoke_infer", False))
     smoke_train = bool(getattr(args, "smoke_train", False))
     if smoke_infer or smoke_train:
@@ -198,8 +298,8 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
         raise click.UsageError("--smoke-infer and --smoke-train are mutually exclusive")
     if tune_params and not algorithm.requires_rollout:
         raise click.UsageError("--tune-params currently supports rollout-based algorithms")
-    if (smoke_infer or smoke_train) and not algorithm.requires_rollout:
-        raise click.UsageError("--smoke-infer and --smoke-train currently support rollout-based algorithms")
+    if smoke_infer and not algorithm.requires_rollout:
+        raise click.UsageError("--smoke-infer currently supports rollout-based algorithms")
     if mem_frac <= 0 or mem_frac > 1:
         raise click.UsageError("--mem-frac must be in (0, 1]")
     if tune_max_samples <= 0:
@@ -223,6 +323,15 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
         raise click.UsageError("--world-size must be positive")
     if args.world_size % args.tp_size != 0:
         raise click.UsageError("--world-size must be divisible by --tp-size")
+    has_rollout_topology = args.rollout_devices is not None or args.rollout_tp_size is not None
+    if has_rollout_topology and not algorithm.requires_rollout:
+        raise click.UsageError("independent rollout devices are only valid for rollout-based algorithms")
+    if args.rollout_devices is not None:
+        rollout_tp_size = args.tp_size if args.rollout_tp_size is None else args.rollout_tp_size
+        if len(args.rollout_devices) % rollout_tp_size != 0:
+            raise click.UsageError("--rollout-devices count must be divisible by --rollout-tp-size")
+    if args.policy_sync_bucket_mb <= 0:
+        raise click.UsageError("--policy-sync-bucket-mb must be positive")
     if args.batch_size <= 0:
         raise click.UsageError("--batch-size must be positive")
     if algorithm.requires_rollout and args.n_samples <= 0:
@@ -244,6 +353,25 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
     if args.agent_timeout_s <= 0:
         raise click.UsageError("--agent-timeout-s must be positive")
     _require_positive_float(args.lr, "--lr")
+    if args.multimodal_tower_lr is not None:
+        _require_positive_float(args.multimodal_tower_lr, "--mm-tower-lr")
+        if not args.unfreeze_multimodal_tower:
+            raise click.UsageError("--mm-tower-lr requires --unfreeze-mm-tower")
+    if args.multimodal_projector_lr is not None:
+        _require_positive_float(args.multimodal_projector_lr, "--mm-projector-lr")
+        if not args.unfreeze_multimodal_projector:
+            raise click.UsageError("--mm-projector-lr requires --unfreeze-mm-projector")
+    for group in ("tower", "projector"):
+        enabled = getattr(args, f"unfreeze_multimodal_{group}")
+        min_lr = getattr(args, f"multimodal_{group}_min_lr")
+        decay_steps = getattr(args, f"multimodal_{group}_lr_decay_steps")
+        decay_style = getattr(args, f"multimodal_{group}_lr_decay_style")
+        if min_lr is not None and min_lr < 0:
+            raise click.UsageError(f"--mm-{group}-min-lr must be non-negative")
+        if decay_steps is not None and decay_steps <= 0:
+            raise click.UsageError(f"--mm-{group}-lr-steps must be positive")
+        if any(value is not None for value in (min_lr, decay_steps, decay_style)) and not enabled:
+            raise click.UsageError(f"multimodal {group} LR options require --unfreeze-mm-{group}")
     if args.min_lr < 0:
         raise click.UsageError("--min-lr must be non-negative")
     if args.lr_decay_steps <= 0:
@@ -280,6 +408,56 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
 def _require_positive_float(value: float, option_name: str) -> None:
     if value <= 0:
         raise click.UsageError(f"{option_name} must be positive")
+
+
+def _lora_config_from_options(args):
+    rank = getattr(args, "lora_rank", None)
+    adapter_path = getattr(args, "lora_adapter_path", None)
+    if rank is None and adapter_path is None:
+        return None
+    from areno.adapters import LoraConfig
+
+    targets = tuple(item.strip() for item in args.lora_target_modules.split(",") if item.strip())
+    try:
+        return LoraConfig(
+            rank=8 if rank is None else rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_modules=targets,
+            adapter_path=adapter_path,
+        )
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+
+def _parse_cuda_devices(value: str | None, option_name: str) -> list[int] | None:
+    """Parse CUDA indices and inclusive ranges such as ``0..3,8``."""
+
+    if value is None:
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        raise click.UsageError(f"{option_name} must be a comma-separated list of CUDA indices or ranges")
+    devices = []
+    try:
+        for part in parts:
+            if ".." not in part:
+                devices.append(int(part))
+                continue
+            endpoints = part.split("..")
+            if len(endpoints) != 2 or not all(endpoints):
+                raise ValueError
+            start, end = (int(endpoint) for endpoint in endpoints)
+            if start > end:
+                raise click.UsageError(f"{option_name} range start must not exceed range end: {part}")
+            devices.extend(range(start, end + 1))
+    except ValueError as exc:
+        raise click.UsageError(f"{option_name} must contain only integer CUDA indices or ranges") from exc
+    if any(device < 0 for device in devices):
+        raise click.UsageError(f"{option_name} must not contain negative CUDA device indices")
+    if len(devices) != len(set(devices)):
+        raise click.UsageError(f"{option_name} must not contain duplicate CUDA device indices")
+    return devices
 
 
 def _format_training_config_summary(
@@ -323,6 +501,18 @@ def _format_training_config_summary(
                 ("world_size", str(config.world_size)),
                 ("tp_size", str(config.tp_size)),
                 ("dp_size", _resolved_dp_size_for_summary(config)),
+                (
+                    "devices",
+                    (
+                        "Apple Metal"
+                        if config.backend == "mlx"
+                        else (
+                            ",".join(str(device) for device in config.train_devices)
+                            if config.train_devices is not None
+                            else f"0..{config.world_size - 1}"
+                        )
+                    ),
+                ),
                 ("attn_backend", attn_backend),
                 (
                     "thinking",
@@ -335,9 +525,21 @@ def _format_training_config_summary(
             "Training",
             [
                 ("max_steps", _format_optional(config.max_steps)),
+                ("sequence_parallel", _sequence_parallel_for_summary(config, model_config)),
                 ("mini_bs", str(config.mini_bs)),
                 ("score_micro_bs", str(config.score_micro_bs)),
                 ("gradient_accumulation_steps", _format_optional(config.gradient_accumulation_steps, default="auto")),
+                ("lora_rank", str(config.lora.rank) if config.lora is not None else "disabled"),
+                ("lora_alpha", str(config.lora.alpha) if config.lora is not None else "n/a"),
+                ("lora_dropout", str(config.lora.dropout) if config.lora is not None else "n/a"),
+                (
+                    "lora_target_modules",
+                    ",".join(config.lora.target_modules) if config.lora is not None else "n/a",
+                ),
+                (
+                    "lora_adapter_path",
+                    _format_optional(config.lora.adapter_path) if config.lora is not None else "n/a",
+                ),
                 (
                     "optimizer",
                     (
@@ -347,6 +549,9 @@ def _format_training_config_summary(
                         f"weight_decay={config.weight_decay}, adam_8bit={_format_bool(config.adam_8bit)}"
                     ),
                 ),
+                ("optimizer_state_offload", str(config.optimizer_state_offload)),
+                ("optimizer_state_offload_dir", _format_optional(config.optimizer_state_offload_dir)),
+                ("optimizer_state_offload_batch_size", str(config.optimizer_state_offload_batch_size)),
                 ("grad_clip_norm", str(config.grad_clip_norm)),
             ],
         ),
@@ -445,6 +650,27 @@ def _rollout_summary_rows(config: TrainerConfig) -> list[tuple[str, str]]:
         ]
     return [
         *base,
+        (
+            "topology",
+            (
+                "shared with train engine"
+                if config.rollout_devices is None
+                else (
+                    f"world={len(config.rollout_devices)}, "
+                    f"tp={config.rollout_tp_size or config.tp_size}, "
+                    f"dp={len(config.rollout_devices) // (config.rollout_tp_size or config.tp_size)}, "
+                    f"devices={','.join(str(device) for device in config.rollout_devices)}"
+                )
+            ),
+        ),
+        (
+            "policy_sync",
+            (
+                "shared weights"
+                if config.rollout_devices is None
+                else f"NCCL direct, lazy, bucket={config.policy_sync_bucket_mb} MiB"
+            ),
+        ),
         ("n_samples", str(config.n_samples)),
         ("max_running_prompts", str(config.resolved_max_running_prompts())),
         (
@@ -466,6 +692,8 @@ def _reward_ckpt_for_summary(config: TrainerConfig, reward_ckpt: str | None) -> 
 def _resolved_attn_backend_for_summary(
     config: TrainerConfig, *, model_config: ModelConfig | None = None
 ) -> tuple[str, str | None]:
+    if config.backend == "mlx":
+        return "mlx", None
     if config.attn_backend != "flash":
         return config.attn_backend, None
     reasons = [
@@ -488,11 +716,11 @@ def _resolved_attn_backend_for_summary(
 
 
 def _model_config_for_summary(config: TrainerConfig) -> ModelConfig | None:
+    if config.backend == "mlx":
+        return None
     if not Path(config.ckpt).exists():
         return None
     try:
-        from areno.models.registry import config_from_hf
-
         return config_from_hf(config.ckpt)
     except Exception:
         return None
@@ -504,6 +732,20 @@ def _callable_name(fn) -> str:
 
 def _resolved_dp_size_for_summary(config: TrainerConfig) -> str:
     return str(config.world_size // config.tp_size) if config.tp_size else "n/a"
+
+
+def _sequence_parallel_for_summary(config: TrainerConfig, model_config: ModelConfig | None) -> str:
+    if config.sequence_parallel is not None:
+        requested = bool(config.sequence_parallel)
+        source = "CLI"
+    elif model_config is not None:
+        requested = bool(model_config.sequence_parallel)
+        source = "model config"
+    else:
+        return "model config (resolved at load)"
+    enabled = requested and config.tp_size > 1
+    suffix = source if config.tp_size > 1 else f"{source}; disabled for TP1"
+    return f"{_format_bool(enabled)} ({suffix})"
 
 
 def _format_bool(value: bool) -> str:
@@ -596,8 +838,27 @@ def _trainer_config_from_args(args) -> TrainerConfig:
     # Each algorithm gets the narrowest config dataclass it needs; offline
     # trainers do not receive rollout/reward/GSPO fields by construction.
     args.max_steps = getattr(args, "max_steps", None)
+    args.backend = getattr(args, "backend", None)
     args.score_micro_bs = getattr(args, "score_micro_bs", 8)
     args.model_hub = getattr(args, "model_hub", "modelscope")
+    args.base_model_name_or_path = getattr(args, "base_model_name_or_path", None)
+    args.train_devices = getattr(args, "train_devices", None)
+    args.sequence_parallel = getattr(args, "sequence_parallel", None)
+    args.rollout_tp_size = getattr(args, "rollout_tp_size", None)
+    args.rollout_devices = getattr(args, "rollout_devices", None)
+    args.policy_sync_bucket_mb = getattr(args, "policy_sync_bucket_mb", 64)
+    args.unfreeze_multimodal_tower = getattr(args, "unfreeze_multimodal_tower", False)
+    args.unfreeze_multimodal_projector = getattr(args, "unfreeze_multimodal_projector", False)
+    args.multimodal_tower_lr = getattr(args, "multimodal_tower_lr", None)
+    args.multimodal_tower_min_lr = getattr(args, "multimodal_tower_min_lr", None)
+    args.multimodal_tower_lr_decay_steps = getattr(args, "multimodal_tower_lr_decay_steps", None)
+    args.multimodal_tower_lr_decay_style = getattr(args, "multimodal_tower_lr_decay_style", None)
+    args.multimodal_projector_lr = getattr(args, "multimodal_projector_lr", None)
+    args.multimodal_projector_min_lr = getattr(args, "multimodal_projector_min_lr", None)
+    args.multimodal_projector_lr_decay_steps = getattr(args, "multimodal_projector_lr_decay_steps", None)
+    args.multimodal_projector_lr_decay_style = getattr(args, "multimodal_projector_lr_decay_style", None)
+    args.reference_mode = getattr(args, "reference_mode", "independent")
+    lora = getattr(args, "lora", None)
     algorithm = get_algorithm(args.algo)
     chat_template_enable_thinking = False if args.disable_thinking else None
     if algorithm.name == "dpo":
@@ -605,6 +866,8 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             algo=algorithm.name,
             ckpt=args.ckpt,
             dataset_path=args.dataset_path,
+            backend=args.backend,
+            base_model_name_or_path=args.base_model_name_or_path,
             model_hub=args.model_hub,
             dataset_loader_fn=args.dataset_loader_fn,
             save_path=args.save_path,
@@ -612,7 +875,9 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             epochs=args.epochs,
             max_steps=args.max_steps,
             tp_size=args.tp_size,
+            sequence_parallel=args.sequence_parallel,
             world_size=args.world_size,
+            train_devices=args.train_devices,
             batch_size=args.batch_size,
             mini_bs=args.mini_bs,
             score_micro_bs=args.score_micro_bs,
@@ -629,8 +894,21 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             weight_decay=args.weight_decay,
             grad_clip_norm=args.grad_clip_norm,
             adam_8bit=args.adam_8bit,
+            unfreeze_multimodal_tower=args.unfreeze_multimodal_tower,
+            unfreeze_multimodal_projector=args.unfreeze_multimodal_projector,
+            multimodal_tower_lr=args.multimodal_tower_lr,
+            multimodal_tower_min_lr=args.multimodal_tower_min_lr,
+            multimodal_tower_lr_decay_steps=args.multimodal_tower_lr_decay_steps,
+            multimodal_tower_lr_decay_style=args.multimodal_tower_lr_decay_style,
+            multimodal_projector_lr=args.multimodal_projector_lr,
+            multimodal_projector_min_lr=args.multimodal_projector_min_lr,
+            multimodal_projector_lr_decay_steps=args.multimodal_projector_lr_decay_steps,
+            multimodal_projector_lr_decay_style=args.multimodal_projector_lr_decay_style,
             activation_checkpointing=args.activation_checkpointing,
             keep_rollout_state=not args.drop_rollout_state,
+            optimizer_state_offload=args.optimizer_state_offload,
+            optimizer_state_offload_dir=args.optimizer_state_offload_dir,
+            optimizer_state_offload_batch_size=args.optimizer_state_offload_batch_size,
             eager_decode=args.eager_decode,
             attn_backend=args.attn_backend,
             metrics_log_dir=args.metrics_log_dir,
@@ -640,12 +918,16 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             chat_template_enable_thinking=chat_template_enable_thinking,
             ref_ckpt=args.ref_ckpt,
             dpo_beta=args.dpo_beta,
+            lora=lora,
+            reference_mode=args.reference_mode,
         )
     if algorithm.name == "sft":
         return TrainerConfig(
             algo=algorithm.name,
             ckpt=args.ckpt,
             dataset_path=args.dataset_path,
+            backend=args.backend,
+            base_model_name_or_path=args.base_model_name_or_path,
             model_hub=args.model_hub,
             dataset_loader_fn=args.dataset_loader_fn,
             save_path=args.save_path,
@@ -653,7 +935,9 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             epochs=args.epochs,
             max_steps=args.max_steps,
             tp_size=args.tp_size,
+            sequence_parallel=args.sequence_parallel,
             world_size=args.world_size,
+            train_devices=args.train_devices,
             batch_size=args.batch_size,
             mini_bs=args.mini_bs,
             score_micro_bs=args.score_micro_bs,
@@ -670,8 +954,21 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             weight_decay=args.weight_decay,
             grad_clip_norm=args.grad_clip_norm,
             adam_8bit=args.adam_8bit,
+            unfreeze_multimodal_tower=args.unfreeze_multimodal_tower,
+            unfreeze_multimodal_projector=args.unfreeze_multimodal_projector,
+            multimodal_tower_lr=args.multimodal_tower_lr,
+            multimodal_tower_min_lr=args.multimodal_tower_min_lr,
+            multimodal_tower_lr_decay_steps=args.multimodal_tower_lr_decay_steps,
+            multimodal_tower_lr_decay_style=args.multimodal_tower_lr_decay_style,
+            multimodal_projector_lr=args.multimodal_projector_lr,
+            multimodal_projector_min_lr=args.multimodal_projector_min_lr,
+            multimodal_projector_lr_decay_steps=args.multimodal_projector_lr_decay_steps,
+            multimodal_projector_lr_decay_style=args.multimodal_projector_lr_decay_style,
             activation_checkpointing=args.activation_checkpointing,
             keep_rollout_state=not args.drop_rollout_state,
+            optimizer_state_offload=args.optimizer_state_offload,
+            optimizer_state_offload_dir=args.optimizer_state_offload_dir,
+            optimizer_state_offload_batch_size=args.optimizer_state_offload_batch_size,
             eager_decode=args.eager_decode,
             attn_backend=args.attn_backend,
             metrics_log_dir=args.metrics_log_dir,
@@ -679,12 +976,16 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             agent_timeout_s=args.agent_timeout_s,
             train_tool_results=args.train_tool_results,
             chat_template_enable_thinking=chat_template_enable_thinking,
+            lora=lora,
+            reference_mode=args.reference_mode,
         )
     if algorithm.name != "ppo":
         return PolicyTrainerConfig(
             algo=algorithm.name,
             ckpt=args.ckpt,
             dataset_path=args.dataset_path,
+            backend=args.backend,
+            base_model_name_or_path=args.base_model_name_or_path,
             model_hub=args.model_hub,
             dataset_loader_fn=args.dataset_loader_fn,
             reward_fn_path=args.reward_fn_path,
@@ -693,7 +994,12 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             epochs=args.epochs,
             max_steps=args.max_steps,
             tp_size=args.tp_size,
+            sequence_parallel=args.sequence_parallel,
             world_size=args.world_size,
+            train_devices=args.train_devices,
+            rollout_tp_size=args.rollout_tp_size,
+            rollout_devices=args.rollout_devices,
+            policy_sync_bucket_mb=args.policy_sync_bucket_mb,
             batch_size=args.batch_size,
             n_samples=args.n_samples,
             mini_bs=args.mini_bs,
@@ -716,8 +1022,21 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             weight_decay=args.weight_decay,
             grad_clip_norm=args.grad_clip_norm,
             adam_8bit=args.adam_8bit,
+            unfreeze_multimodal_tower=args.unfreeze_multimodal_tower,
+            unfreeze_multimodal_projector=args.unfreeze_multimodal_projector,
+            multimodal_tower_lr=args.multimodal_tower_lr,
+            multimodal_tower_min_lr=args.multimodal_tower_min_lr,
+            multimodal_tower_lr_decay_steps=args.multimodal_tower_lr_decay_steps,
+            multimodal_tower_lr_decay_style=args.multimodal_tower_lr_decay_style,
+            multimodal_projector_lr=args.multimodal_projector_lr,
+            multimodal_projector_min_lr=args.multimodal_projector_min_lr,
+            multimodal_projector_lr_decay_steps=args.multimodal_projector_lr_decay_steps,
+            multimodal_projector_lr_decay_style=args.multimodal_projector_lr_decay_style,
             activation_checkpointing=args.activation_checkpointing,
             keep_rollout_state=not args.drop_rollout_state,
+            optimizer_state_offload=args.optimizer_state_offload,
+            optimizer_state_offload_dir=args.optimizer_state_offload_dir,
+            optimizer_state_offload_batch_size=args.optimizer_state_offload_batch_size,
             eager_decode=args.eager_decode,
             attn_backend=args.attn_backend,
             gspo_clip_eps=args.gspo_clip_eps,
@@ -727,11 +1046,15 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             agent_timeout_s=args.agent_timeout_s,
             train_tool_results=args.train_tool_results,
             chat_template_enable_thinking=chat_template_enable_thinking,
+            lora=lora,
+            reference_mode=args.reference_mode,
         )
     return PPOTrainerConfig(
         algo=algorithm.name,
         ckpt=args.ckpt,
         dataset_path=args.dataset_path,
+        backend=args.backend,
+        base_model_name_or_path=args.base_model_name_or_path,
         model_hub=args.model_hub,
         dataset_loader_fn=args.dataset_loader_fn,
         reward_fn_path=args.reward_fn_path,
@@ -740,7 +1063,12 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         epochs=args.epochs,
         max_steps=args.max_steps,
         tp_size=args.tp_size,
+        sequence_parallel=args.sequence_parallel,
         world_size=args.world_size,
+        train_devices=args.train_devices,
+        rollout_tp_size=args.rollout_tp_size,
+        rollout_devices=args.rollout_devices,
+        policy_sync_bucket_mb=args.policy_sync_bucket_mb,
         batch_size=args.batch_size,
         n_samples=args.n_samples,
         mini_bs=args.mini_bs,
@@ -763,8 +1091,21 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
         adam_8bit=args.adam_8bit,
+        unfreeze_multimodal_tower=args.unfreeze_multimodal_tower,
+        unfreeze_multimodal_projector=args.unfreeze_multimodal_projector,
+        multimodal_tower_lr=args.multimodal_tower_lr,
+        multimodal_tower_min_lr=args.multimodal_tower_min_lr,
+        multimodal_tower_lr_decay_steps=args.multimodal_tower_lr_decay_steps,
+        multimodal_tower_lr_decay_style=args.multimodal_tower_lr_decay_style,
+        multimodal_projector_lr=args.multimodal_projector_lr,
+        multimodal_projector_min_lr=args.multimodal_projector_min_lr,
+        multimodal_projector_lr_decay_steps=args.multimodal_projector_lr_decay_steps,
+        multimodal_projector_lr_decay_style=args.multimodal_projector_lr_decay_style,
         activation_checkpointing=args.activation_checkpointing,
         keep_rollout_state=not args.drop_rollout_state,
+        optimizer_state_offload=args.optimizer_state_offload,
+        optimizer_state_offload_dir=args.optimizer_state_offload_dir,
+        optimizer_state_offload_batch_size=args.optimizer_state_offload_batch_size,
         eager_decode=args.eager_decode,
         attn_backend=args.attn_backend,
         gspo_clip_eps=args.gspo_clip_eps,
@@ -788,6 +1129,8 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         agent_timeout_s=args.agent_timeout_s,
         train_tool_results=args.train_tool_results,
         chat_template_enable_thinking=chat_template_enable_thinking,
+        lora=lora,
+        reference_mode=args.reference_mode,
     )
 
 
@@ -811,9 +1154,10 @@ def run(trainer_config: TrainerConfig):
     api_trainer = areno.api.Trainer(
         trainer_config.world_size,
         trainer_config.ckpt,
-        backend_type=areno.api.Areno,
+        backend_type=trainer_config.backend_type(),
         metrics_log_dir=trainer_config.metrics_log_dir,
-        custom_config=trainer_config.areno_config(),
+        custom_config=trainer_config.backend_config(),
+        score_micro_bs=trainer_config.score_micro_bs,
     )
     dataset = _load_dataset_for_training(
         trainer_config.dataset_path,
@@ -852,13 +1196,17 @@ def _write_dashboard_run_config(config: TrainerConfig) -> None:
 def _training_config_settings(config: TrainerConfig) -> dict:
     used: set[str] = set()
 
+    def value(name: str):
+        item = getattr(config, name)
+        return asdict(item) if is_dataclass(item) else item
+
     def section(title: str, names: list[str]) -> dict:
         items = []
         for name in names:
             if not hasattr(config, name):
                 continue
             used.add(name)
-            items.append({"key": name, "value": getattr(config, name)})
+            items.append({"key": name, "value": value(name)})
         return {"title": title, "items": items}
 
     sections = [
@@ -879,10 +1227,14 @@ def _training_config_settings(config: TrainerConfig) -> dict:
             [
                 "world_size",
                 "tp_size",
+                "sequence_parallel",
                 "attn_backend",
                 "eager_decode",
                 "activation_checkpointing",
                 "keep_rollout_state",
+                "optimizer_state_offload",
+                "optimizer_state_offload_dir",
+                "optimizer_state_offload_batch_size",
                 "chat_template_enable_thinking",
             ],
         ),
@@ -956,7 +1308,7 @@ def _training_config_settings(config: TrainerConfig) -> dict:
     extras = []
     for field in fields(config):
         if field.name not in used:
-            extras.append({"key": field.name, "value": getattr(config, field.name)})
+            extras.append({"key": field.name, "value": value(field.name)})
     if extras:
         sections.append({"title": "Other", "items": extras})
     if isinstance(config, RolloutTrainerConfig):
@@ -1165,6 +1517,11 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
 @click.option("--algo", type=str, default="gspo", show_default=True, help="Training algorithm registered in areno.api.")
 @click.option("--ckpt", default=None, help="Actor model/tokenizer checkpoint path or remote model repo ID.")
 @click.option(
+    "--base-model-name-or-path",
+    default=None,
+    help="Stable base model reference written to PEFT adapter metadata; defaults to the original --ckpt value.",
+)
+@click.option(
     "--dataset-path", default=None, help="Training dataset path, HF save_to_disk directory, or remote dataset ref."
 )
 @click.option(
@@ -1221,8 +1578,46 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     is_flag=True,
     help="Dummy-load the model and run one minimal synthetic train step, then exit.",
 )
-@click.option("--tp-size", type=int, default=4, show_default=True, help="Tensor parallel size for the backend.")
+@click.option(
+    "--tp-size",
+    "--train-tp-size",
+    "tp_size",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Tensor parallel size for training.",
+)
+@click.option(
+    "--sequence-parallel/--no-sequence-parallel",
+    default=None,
+    help="Override checkpoint sequence_parallel; when omitted, use the model configuration.",
+)
 @click.option("--world-size", type=int, default=8, show_default=True, help="Total device count for the backend.")
+@click.option(
+    "--train-devices",
+    type=str,
+    default=None,
+    help="CUDA devices for training, with inclusive ranges such as 0..7,10; defaults to devices from --world-size.",
+)
+@click.option(
+    "--rollout-tp-size",
+    type=int,
+    default=None,
+    help="Tensor parallel size for an independent rollout engine using the training device set by default.",
+)
+@click.option(
+    "--rollout-devices",
+    type=str,
+    default=None,
+    help="CUDA devices for the independent rollout engine; defaults to the training device set when omitted.",
+)
+@click.option(
+    "--policy-sync-bucket-mb",
+    type=int,
+    default=64,
+    show_default=True,
+    help="Maximum GPU buffer size used by direct NCCL policy synchronization.",
+)
 @click.option("--batch-size", type=int, default=32, show_default=True, help="Prompt/pair batch size.")
 @click.option(
     "--n-samples", type=int, default=8, show_default=True, help="Rollout samples per prompt for RL algorithms."
@@ -1263,12 +1658,90 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     help="Override global concurrent rollout prompts; defaults to batch-size * n-samples.",
 )
 @click.option("--lr", type=float, default=1.0e-6, show_default=True, help="Policy optimizer learning rate.")
+@click.option("--lora-rank", type=int, default=None, help="Enable native LoRA with this rank.")
+@click.option("--lora-alpha", type=float, default=16.0, show_default=True, help="Native LoRA alpha.")
+@click.option("--lora-dropout", type=float, default=0.0, show_default=True, help="Native LoRA dropout (must be 0).")
+@click.option(
+    "--lora-target-modules",
+    default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    show_default=True,
+    help=(
+        "Comma-separated native projection targets (MoE MLP targets apply to each routed expert; "
+        "selected Bailing V3 KDA q/k/v/f/g projections use independent canonical adapters)."
+    ),
+)
+@click.option("--lora-adapter-path", default=None, help="Standard PEFT adapter used to initialize native LoRA.")
+@click.option(
+    "--reference-mode",
+    type=click.Choice(["independent", "reuse_actor_base"]),
+    default="independent",
+    show_default=True,
+    help="Use the frozen actor base as the PPO/DPO reference instead of loading a second reference model.",
+)
 @click.option("--min-lr", type=float, default=1.0e-7, show_default=True, help="Policy optimizer minimum learning rate.")
 @click.option("--lr-decay-steps", type=int, default=1000, show_default=True, help="Policy LR decay steps.")
 @click.option("--lr-decay-style", default="cosine", show_default=True, help="Policy LR decay style.")
 @click.option("--adam-beta1", type=float, default=0.9, show_default=True, help="Policy optimizer Adam beta1.")
 @click.option("--adam-beta2", type=float, default=0.999, show_default=True, help="Policy optimizer Adam beta2.")
 @click.option("--adam-8bit", is_flag=True, help="Use 8-bit Adam moment states instead of FP32 Adam states.")
+@click.option("--unfreeze-mm-tower", "unfreeze_multimodal_tower", is_flag=True, help="Train multimodal encoder towers.")
+@click.option(
+    "--unfreeze-mm-projector",
+    "--unfreeze-mm-merger",
+    "unfreeze_multimodal_projector",
+    is_flag=True,
+    help="Train multimodal projectors/mergers.",
+)
+@click.option(
+    "--mm-tower-lr",
+    "multimodal_tower_lr",
+    type=float,
+    default=None,
+    help="Learning rate for unfrozen multimodal towers; defaults to --lr.",
+)
+@click.option("--mm-tower-min-lr", "multimodal_tower_min_lr", type=float, default=None, help="Tower minimum LR.")
+@click.option(
+    "--mm-tower-lr-steps", "multimodal_tower_lr_decay_steps", type=int, default=None, help="Tower LR decay steps."
+)
+@click.option(
+    "--mm-tower-lr-style",
+    "multimodal_tower_lr_decay_style",
+    type=click.Choice(["constant", "linear", "cosine"]),
+    default=None,
+    help="Tower LR decay style.",
+)
+@click.option(
+    "--mm-projector-lr",
+    "--mm-merger-lr",
+    "multimodal_projector_lr",
+    type=float,
+    default=None,
+    help="Learning rate for unfrozen multimodal projectors/mergers; defaults to --lr.",
+)
+@click.option(
+    "--mm-projector-min-lr",
+    "--mm-merger-min-lr",
+    "multimodal_projector_min_lr",
+    type=float,
+    default=None,
+    help="Projector/merger minimum LR.",
+)
+@click.option(
+    "--mm-projector-lr-steps",
+    "--mm-merger-lr-steps",
+    "multimodal_projector_lr_decay_steps",
+    type=int,
+    default=None,
+    help="Projector/merger LR decay steps.",
+)
+@click.option(
+    "--mm-projector-lr-style",
+    "--mm-merger-lr-style",
+    "multimodal_projector_lr_decay_style",
+    type=click.Choice(["constant", "linear", "cosine"]),
+    default=None,
+    help="Projector/merger LR decay style.",
+)
 @click.option("--weight-decay", type=float, default=1.0e-2, show_default=True, help="Policy optimizer weight decay.")
 @click.option("--grad-clip-norm", type=float, default=1.0, show_default=True, help="Policy gradient clipping norm.")
 @click.option(
@@ -1280,7 +1753,26 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
 @click.option(
     "--drop-rollout-state",
     is_flag=True,
-    help="Drop rollout state after each step to save GPU memory.",
+    help="Release completed rollout KV/cache state after each step.",
+)
+@click.option(
+    "--optimizer-state-offload",
+    type=click.Choice(["none", "cpu", "disk"]),
+    default="none",
+    show_default=True,
+    help="CUDA optimizer-state residency: device, CPU, or persistent raw mmap on local disk.",
+)
+@click.option(
+    "--optimizer-state-offload-dir",
+    type=click.Path(file_okay=False, path_type=str),
+    help="Local NVMe directory used by --optimizer-state-offload disk (required for disk mode).",
+)
+@click.option(
+    "--optimizer-state-offload-batch-size",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Number of optimizer buckets per persistent disk mmap and flush group.",
 )
 @click.option("--eager-decode", is_flag=True, help="Disable decode CUDA graph and run rollout decode eagerly.")
 @click.option(

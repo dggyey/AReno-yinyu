@@ -19,14 +19,21 @@ from areno.engine.checkpoints.common import (
     load_embedding_norm_head,
     rank0_tensor,
     save_embedding_norm_head,
+)
+from areno.engine.checkpoints.io import (
+    PolicyFlatPiece,
+    PolicyTensorLayout,
+    PolicyTensorStore,
+    SafetensorsIndex,
+    _CheckpointTensorTask,
+    _copy_row,
+    _sync_pending_cpu_copies,
+    policy_plan_scope,
     write_hf_safetensors_checkpoint,
 )
-from areno.engine.checkpoints.io import SafetensorsIndex, _CheckpointTensorTask, _copy_row, _sync_pending_cpu_copies
 from areno.engine.layers.linear import _shard_range
 from areno.engine.parallel.context import get_tp_context
 from areno.models.minicpmv46.model import (
-    _LINEAR_HEAD_DIM,
-    _LINEAR_NUM_HEADS,
     MiniCPMDecoderLayer,
     MiniCPMFullAttention,
     MiniCPMGatedDeltaNet,
@@ -71,7 +78,7 @@ GDN_KEYS = (
 
 @torch.no_grad()
 def load_minicpmv46_weights(model: MiniCPMV46ForCausalLM, model_path: str | Path) -> None:
-    """Load MiniCPM-V-4.6 text weights from the HF safetensors checkpoint.
+    """Load MiniCPM-V-4.6 text, vision, and projector weights.
 
     The HF checkpoint wraps the language model under `model.language_model`.
     Full-attention q projection stores q and output-gate rows in one tensor,
@@ -84,11 +91,15 @@ def load_minicpmv46_weights(model: MiniCPMV46ForCausalLM, model_path: str | Path
     index = SafetensorsIndex(model_path)
     try:
         prefix = model.config.checkpoint_prefix
-        index.set_progress_total(1 + len(model.layers), unit="stage", manual=True)
+        vision_stages = 1 if model.vision_tower is not None else 0
+        index.set_progress_total(1 + len(model.layers) + vision_stages, unit="stage", manual=True)
         _load_embedding_norm_head(model, index, ctx.rank, ctx.world_size)
         index.advance_progress()
         for layer_idx, layer in enumerate(model.layers):
             _load_layer(index, layer, f"{prefix}.layers.{layer_idx}", ctx.rank, ctx.world_size)
+            index.advance_progress()
+        if model.vision_tower is not None:
+            _load_vision_weights(model, index)
             index.advance_progress()
     finally:
         index.close()
@@ -98,10 +109,11 @@ def load_minicpmv46_weights(model: MiniCPMV46ForCausalLM, model_path: str | Path
 def save_minicpmv46_weights(
     model: MiniCPMV46ForCausalLM, output_path: str | Path, source_path: str | Path | None
 ) -> str | None:
-    """Save MiniCPM-V-4.6 text weights back to HF safetensors layout."""
+    """Save MiniCPM-V-4.6 text, vision, and projector weights."""
 
     tensors = CheckpointTensorStore()
     _save_embedding_norm_head(tensors, model)
+    _save_vision_weights(tensors, model)
     prefix = model.config.checkpoint_prefix
     for layer_idx, layer in enumerate(model.layers):
         _save_layer(tensors, layer, f"{prefix}.layers.{layer_idx}")
@@ -109,6 +121,19 @@ def save_minicpmv46_weights(
     if saved_path is not None and source_path is not None:
         copy_source_passthrough_weights(source_path, saved_path, protected_prefix=f"{prefix}.")
     return saved_path
+
+
+def build_minicpmv46_policy_plan(model: MiniCPMV46ForCausalLM) -> PolicyTensorStore:
+    """Build live canonical tasks without checkpoint materialization."""
+
+    tensors = PolicyTensorStore()
+    with policy_plan_scope():
+        _save_embedding_norm_head(tensors, model)
+        _save_vision_weights(tensors, model)
+        prefix = model.config.checkpoint_prefix
+        for layer_idx, layer in enumerate(model.layers):
+            _save_layer(tensors, layer, f"{prefix}.layers.{layer_idx}")
+    return tensors
 
 
 def _load_embedding_norm_head(
@@ -120,7 +145,33 @@ def _load_embedding_norm_head(
 
 def _save_embedding_norm_head(tensors: dict[str, torch.Tensor | None], model: MiniCPMV46ForCausalLM) -> None:
     save_embedding_norm_head(tensors, model, TOP_LEVEL_SPEC)
-    tensors[TOP_LEVEL_SPEC.norm_key] = rank0_tensor(model.norm.weight - 1.0)
+    tensors[TOP_LEVEL_SPEC.norm_key] = rank0_tensor(
+        model.norm.weight if isinstance(tensors, PolicyTensorStore) else model.norm.weight - 1.0
+    )
+
+
+@torch.no_grad()
+def _load_vision_weights(model: MiniCPMV46ForCausalLM, index: SafetensorsIndex) -> None:
+    """Load replicated vision/projector parameters from the HF layout."""
+
+    for module_name, module in (("vision_tower", model.vision_tower), ("merger", model.merger)):
+        if module is None:
+            continue
+        for name, parameter in module.named_parameters():
+            key = f"model.{module_name}.{name}"
+            if key not in index.weight_map:
+                raise KeyError(f"missing MiniCPM-V vision weight {key}")
+            parameter.copy_(index.get_tensor(key).to(device=parameter.device, dtype=parameter.dtype))
+
+
+def _save_vision_weights(tensors: dict[str, torch.Tensor | None], model: MiniCPMV46ForCausalLM) -> None:
+    """Save replicated vision/projector parameters under the HF prefixes."""
+
+    for module_name, module in (("vision_tower", model.vision_tower), ("merger", model.merger)):
+        if module is None:
+            continue
+        for name, parameter in module.named_parameters():
+            tensors[f"model.{module_name}.{name}"] = rank0_tensor(parameter)
 
 
 def _load_layer(index: SafetensorsIndex, layer: MiniCPMDecoderLayer, prefix: str, rank: int, world_size: int) -> None:
@@ -156,7 +207,10 @@ def _load_layer(index: SafetensorsIndex, layer: MiniCPMDecoderLayer, prefix: str
 
 def _save_layer(tensors: dict[str, torch.Tensor | None], layer: MiniCPMDecoderLayer, prefix: str) -> None:
     for spec in LAYER_NORM_SPECS:
-        tensors[spec.key.format(prefix=prefix)] = rank0_tensor(_attr_path(layer, spec.attr) - 1.0)
+        value = _attr_path(layer, spec.attr)
+        tensors[spec.key.format(prefix=prefix)] = rank0_tensor(
+            value if isinstance(tensors, PolicyTensorStore) else value - 1.0
+        )
     gate_weight, up_weight = gather_tensor_parallel_column_tensors(
         list(_attr_path(layer, GATE_UP_WEIGHT_SPEC.dst_attr).split(layer.mlp.gate_up_proj.local_out_features, dim=0))
     )
@@ -211,14 +265,7 @@ def _load_gated_delta_net(
     index: SafetensorsIndex, attn: MiniCPMGatedDeltaNet, prefix: str, rank: int, world_size: int
 ) -> None:
     qkv = index.get_tensor(f"{prefix}.linear_attn.in_proj_qkv.weight")
-    q, k, v = qkv.split(
-        (
-            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
-            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
-            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
-        ),
-        dim=0,
-    )
+    q, k, v = qkv.split((attn.key_dim, attn.key_dim, attn.value_dim), dim=0)
     copy_merged_column(
         attn.in_proj_qkvz.weight,
         [q, k, v, index.get_tensor(f"{prefix}.linear_attn.in_proj_z.weight")],
@@ -235,16 +282,9 @@ def _load_gated_delta_net(
         world_size,
     )
     conv_qkv = index.get_tensor(f"{prefix}.linear_attn.conv1d.weight")
-    conv_parts = conv_qkv.split(
-        (
-            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
-            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
-            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
-        ),
-        dim=0,
-    )
+    conv_parts = conv_qkv.split((attn.key_dim, attn.key_dim, attn.value_dim), dim=0)
     copy_merged_column(attn.conv1d_weight, list(conv_parts), rank, world_size)
-    start, end = _shard_range(_LINEAR_NUM_HEADS, rank, world_size)
+    start, end = _shard_range(attn.num_value_heads, rank, world_size)
     attn.dt_bias.copy_(index.get_tensor(f"{prefix}.linear_attn.dt_bias")[start:end].to(dtype=attn.dt_bias.dtype))
     attn.A_log.copy_(index.get_tensor(f"{prefix}.linear_attn.A_log")[start:end].to(dtype=attn.A_log.dtype))
     attn.norm_weight.copy_(index.get_tensor(f"{prefix}.linear_attn.norm.weight").to(dtype=attn.norm_weight.dtype))
@@ -257,16 +297,46 @@ def _save_full_attention(tensors: dict[str, torch.Tensor | None], attn: MiniCPMF
     gate = attn.qkv_proj.weight[q_size : q_size + gate_size]
     k = attn.qkv_proj.weight[q_size + gate_size : q_size + gate_size + k_size]
     v = attn.qkv_proj.weight[q_size + gate_size + k_size : q_size + gate_size + k_size + v_size]
-    q_weight, gate_weight = gather_tensor_parallel_column_tensors([q, gate])
-    tensors[f"{prefix}.self_attn.q_proj.weight"] = _merge_q_gate_by_head(
-        q_weight, gate_weight, attn.num_heads, attn.head_dim
-    )
+    q_key = f"{prefix}.self_attn.q_proj.weight"
+    if isinstance(tensors, PolicyTensorStore):
+        ctx = get_tp_context()
+        local_heads = q.shape[0] // attn.head_dim
+        head_numel = attn.head_dim * q.shape[1]
+        pieces = []
+        q_heads = q.reshape(local_heads, attn.head_dim, q.shape[1])
+        gate_heads = gate.reshape(local_heads, attn.head_dim, gate.shape[1])
+        for local_head in range(local_heads):
+            global_head = ctx.rank * local_heads + local_head
+            base = global_head * 2 * head_numel
+            pieces.extend(
+                (
+                    PolicyFlatPiece(q_heads[local_head], base),
+                    PolicyFlatPiece(gate_heads[local_head], base + head_numel),
+                )
+            )
+        tensors.add_layout(
+            q_key,
+            PolicyTensorLayout(
+                shape=(attn.num_heads * 2 * attn.head_dim, q.shape[1]),
+                dtype=q.dtype,
+                pieces=(),
+                flat_pieces=tuple(pieces),
+            ),
+        )
+    else:
+        q_weight, gate_weight = gather_tensor_parallel_column_tensors([q, gate])
+        tensors[q_key] = _merge_q_gate_by_head(q_weight, gate_weight, attn.num_heads, attn.head_dim)
     k_weight, v_weight = gather_tensor_parallel_column_tensors([k, v])
     tensors[f"{prefix}.self_attn.k_proj.weight"] = k_weight
     tensors[f"{prefix}.self_attn.v_proj.weight"] = v_weight
     tensors[f"{prefix}.self_attn.o_proj.weight"] = gather_tensor_parallel_tensor(attn.o_proj.weight, dim=1)
-    tensors[f"{prefix}.self_attn.q_norm.weight"] = rank0_tensor(attn.q_norm.weight - 1.0)
-    tensors[f"{prefix}.self_attn.k_norm.weight"] = rank0_tensor(attn.k_norm.weight - 1.0)
+    policy = isinstance(tensors, PolicyTensorStore)
+    tensors[f"{prefix}.self_attn.q_norm.weight"] = rank0_tensor(
+        attn.q_norm.weight if policy else attn.q_norm.weight - 1.0
+    )
+    tensors[f"{prefix}.self_attn.k_norm.weight"] = rank0_tensor(
+        attn.k_norm.weight if policy else attn.k_norm.weight - 1.0
+    )
 
 
 def _save_gated_delta_net(tensors: dict[str, torch.Tensor | None], attn: MiniCPMGatedDeltaNet, prefix: str) -> None:

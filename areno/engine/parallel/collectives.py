@@ -134,10 +134,7 @@ def broadcast_object(obj: object | None, src: int = 0) -> object:
 def _tp_local_to_global_rank(rank: int) -> int:
     """Translate a TP-local rank (0..tp_size-1) into a global process rank."""
 
-    ctx = get_tp_context()
-    if rank < 0 or rank >= ctx.world_size:
-        raise ValueError(f"rank={rank} is outside TP group size {ctx.world_size}")
-    return ctx.dp_rank * ctx.world_size + rank
+    return get_tp_context().tp_global_rank(rank)
 
 
 class _AllReduceSum(torch.autograd.Function):
@@ -227,16 +224,16 @@ def _all_gather_sequence(x: torch.Tensor, group, world_size: int) -> torch.Tenso
 
 
 def _reduce_scatter_sequence(x: torch.Tensor, group, rank: int, world_size: int) -> torch.Tensor:
-    """Reduce across the TP group, then keep only this rank's seq slice.
-
-    Implemented as an all-reduce + slice because Torch's `reduce_scatter`
-    requires a list of equal-sized tensors; with a contiguous SP layout the
-    all-reduce + narrow path is simpler and equivalent.
-    """
+    """Reduce across the TP group and scatter the summed sequence axis."""
 
     if x.shape[1] % world_size != 0:
         raise RuntimeError(f"sequence length {x.shape[1]} must be divisible by TP size {world_size}")
     chunk = x.shape[1] // world_size
-    out = x.narrow(1, rank * chunk, chunk).contiguous()
-    dist.all_reduce(out, group=group)
-    return out
+    # `reduce_scatter_tensor` splits dimension 0, while AReno stores sequence
+    # on dimension 1. Move sequence first so every output element reduces the
+    # same global token range across ranks; slicing before reduction would mix
+    # rank 0's first chunk with rank 1's second chunk element-by-element.
+    sequence_first = x.movedim(1, 0).contiguous()
+    out = torch.empty((chunk, *sequence_first.shape[1:]), device=x.device, dtype=x.dtype)
+    dist.reduce_scatter_tensor(out, sequence_first, group=group)
+    return out.movedim(0, 1).contiguous()
